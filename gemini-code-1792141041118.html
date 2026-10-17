@@ -817,37 +817,94 @@
                 const liveCorrectCount = computed(() => liveSession.value.submissions.filter(s => s.isCorrect).length);
                 const liveWrongCount = computed(() => liveSession.value.submissions.filter(s => !s.isCorrect).length);
 
-                const handleMultipleStudentAnswer = (conn, studentName, studentAns) => {
-                    if (liveSession.value.isFinished || liveCorrectCount.value >= liveSession.value.targetCorrectAnswers || liveSession.value.timeLeft <= 0) {
-                        conn.send({ type: 'RESULT', status: 'limit_reached' }); return;
-                    }
-                    if (liveSession.value.submissions.some(s => s.student.toLowerCase() === studentName.toLowerCase())) { 
-                        conn.send({ type: 'RESULT', status: 'already_submitted' }); return; 
-                    }
+               // --- CÁC HÀM HỖ TRỢ TỐI ƯU SO KHỚP ĐÁP ÁN ---
+const cleanText = (text) => {
+    if (!text) return '';
+    return text.toString().toLowerCase()
+        .replace(/\s+/g, ' ') // Xoá khoảng trắng thừa, gom nhiều khoảng trắng thành 1
+        .replace(/[\.\,\;\s]+$/, '') // Xoá dấu chấm, phẩy, hoặc khoảng trắng ở cuối câu
+        .trim();
+};
 
-                    const ansStudentClean = studentAns.trim().toLowerCase();
-                    const ansTeacherClean = liveSession.value.correctAnswer.trim().toLowerCase();
-                    const isCorrect = (ansStudentClean === ansTeacherClean);
-                    const now = new Date();
-                    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+const parseMCOption = (text) => {
+    // Tách phương án trắc nghiệm (VD: "A. apple", "a) apple", "a apple", "a . apple", "a.apple")
+    const match = text.match(/^([a-d])\s*([\.\)\-\:]\s*|\s+)(.+)$/);
+    if (match) return { letter: match[1], content: match[3] };
+    
+    // Trường hợp chỉ nhập chữ cái (VD: "A", "a.", "a )")
+    const matchSingle = text.match(/^([a-d])\s*[\.\)\-\:]?\s*$/);
+    if (matchSingle) return { letter: matchSingle[1], content: '' };
+    
+    return null;
+};
 
-                    liveSession.value.submissions.unshift({ student: studentName, answer: studentAns, isCorrect: isCorrect, time: timeStr });
-                    
-                    // CHÚ Ý: Bỏ không gửi `correctAnswer` về học sinh nữa (Để chống học sinh nhìn bài)
-                    conn.send({ type: 'RESULT', status: isCorrect ? 'correct' : 'wrong' });
+const checkAnswer = (studentAns, teacherAns) => {
+    const sClean = cleanText(studentAns);
+    const tClean = cleanText(teacherAns);
 
-                    records.value.push({
-                        id: Date.now(), className: liveSession.value.class, student: studentName, date: form.value.date, semester: form.value.semester, week: form.value.week,
-                        criteriaPlus: { phatBieu: false, lamBaiTap: false, nhanXetDung: false, traLoiDung: isCorrect }, criteriaMinus: { khongLamBai: false, khongChuY: !isCorrect },
-                        plusTicks: isCorrect ? 1 : 0, minusTicks: isCorrect ? 0 : 1, 
-                        comment: "[Nộp ĐT] Câu: \"" + liveSession.value.question + "\" - ĐA: \"" + studentAns + "\" -> " + (isCorrect ? 'ĐÚNG' : 'SAI (Chuẩn: ' + liveSession.value.correctAnswer + ')')
-                    });
+    // Đúng tuyệt đối sau khi đã làm sạch
+    if (sClean === tClean) return true;
 
-                    if (isCorrect && liveCorrectCount.value >= liveSession.value.targetCorrectAnswers) {
-                        liveSession.value.isFinished = true;
-                        if(liveSession.value.timerInterval) clearInterval(liveSession.value.timerInterval);
-                    }
-                };
+    // Tách các đáp án của giáo viên nếu có chữ "hoặc" / "or"
+    const tOptions = tClean.split(/\s+hoặc\s+|\s+or\s+/);
+
+    for (let tOpt of tOptions) {
+        tOpt = cleanText(tOpt);
+        if (sClean === tOpt) return true;
+
+        const tMC = parseMCOption(tOpt);
+        const sMC = parseMCOption(sClean);
+
+        // Trường hợp 1: Đáp án giáo viên có dạng trắc nghiệm (VD GV cài: "A. Hello")
+        if (tMC) {
+            // HS chỉ gõ "A" hoặc "a"
+            if (sClean === tMC.letter) return true; 
+            // HS chỉ gõ "Hello" hoặc "hello"
+            if (sClean === tMC.content) return true; 
+            // HS gõ "A. Hello" nhưng có thể sai dấu chấm/khoảng trắng
+            if (sMC && sMC.content === tMC.content) return true; 
+        }
+        
+        // Trường hợp 2: Đáp án học sinh có dạng trắc nghiệm (VD HS gõ: "A. Hello") 
+        // nhưng giáo viên chỉ cài chữ (VD GV cài: "Hello")
+        if (sMC) {
+            if (sMC.content === tOpt) return true; 
+        }
+    }
+    return false;
+};
+
+// --- HÀM XỬ LÝ NHẬN BÀI CỦA HỌC SINH (ĐÃ CẬP NHẬT) ---
+const handleMultipleStudentAnswer = (conn, studentName, studentAns) => {
+    if (liveSession.value.isFinished || liveCorrectCount.value >= liveSession.value.targetCorrectAnswers || liveSession.value.timeLeft <= 0) {
+        conn.send({ type: 'RESULT', status: 'limit_reached' }); return;
+    }
+    if (liveSession.value.submissions.some(s => s.student.toLowerCase() === studentName.toLowerCase())) { 
+        conn.send({ type: 'RESULT', status: 'already_submitted' }); return; 
+    }
+
+    // GỌI HÀM KIỂM TRA ĐÁP ÁN THÔNG MINH
+    const isCorrect = checkAnswer(studentAns, liveSession.value.correctAnswer);
+
+    const now = new Date();
+    const timeStr = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+
+    liveSession.value.submissions.unshift({ student: studentName, answer: studentAns, isCorrect: isCorrect, time: timeStr });
+    
+    conn.send({ type: 'RESULT', status: isCorrect ? 'correct' : 'wrong' });
+
+    records.value.push({
+        id: Date.now(), className: liveSession.value.class, student: studentName, date: form.value.date, semester: form.value.semester, week: form.value.week,
+        criteriaPlus: { phatBieu: false, lamBaiTap: false, nhanXetDung: false, traLoiDung: isCorrect }, criteriaMinus: { khongLamBai: false, khongChuY: !isCorrect },
+        plusTicks: isCorrect ? 1 : 0, minusTicks: isCorrect ? 0 : 1, 
+        comment: "[Nộp ĐT] Câu: \"" + liveSession.value.question + "\" - ĐA HS: \"" + studentAns + "\" -> " + (isCorrect ? 'ĐÚNG' : 'SAI (Chuẩn: ' + liveSession.value.correctAnswer + ')')
+    });
+
+    if (isCorrect && liveCorrectCount.value >= liveSession.value.targetCorrectAnswers) {
+        liveSession.value.isFinished = true;
+        if(liveSession.value.timerInterval) clearInterval(liveSession.value.timerInterval);
+    }
+};
 
                 // --- LIVE QUIZ STUDENT SIDE ---
                 const studentState = ref({ room: urlParams.get('room'), status: 'connecting', className: '', question: '', studentList: [], selectedStudent: '', answer: '', timeLeft: 0, timerInterval: null });
